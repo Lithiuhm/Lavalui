@@ -1,0 +1,5 @@
+fastapi
+uvicorn[standard]
+wavelink==3.*
+yt-dlp
+aiofiles

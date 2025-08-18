@@ -1,0 +1,47 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="/static/style.css">
+<title>Mi Spotify (Python)</title>
+
+<header><h1>Mi Spotify</h1></header>
+<main>
+  <section class="search">
+    <input id="q" placeholder="Buscar canciones...">
+    <button id="btn">Buscar</button>
+  </section>
+  <section id="results" class="results"></section>
+</main>
+<footer><audio id="player" controls autoplay></audio></footer>
+
+<script>
+const q = document.getElementById('q');
+const btn = document.getElementById('btn');
+const results = document.getElementById('results');
+const player = document.getElementById('player');
+
+function ms(t){const m=Math.floor(t/60000), s=Math.floor((t%60000)/1000); return `${m}:${s.toString().padStart(2,'0')}`;}
+
+async function search(text){
+  const r = await fetch('/api/search?q=' + encodeURIComponent(text));
+  const data = await r.json();
+  results.innerHTML = '';
+  (data.tracks || []).forEach(t => {
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML = `
+      <div class="title">${t.title}</div>
+      <div class="meta">${t.author || ''} • ${ms(t.length || 0)}</div>
+      <a class="meta" href="${t.uri}" target="_blank" rel="noreferrer">Fuente</a>
+      <button class="play">Reproducir</button>`;
+    card.querySelector('.play').onclick = () => {
+      player.src = '/api/stream?uri=' + encodeURIComponent(t.uri);
+      player.play();
+    };
+    results.appendChild(card);
+  });
+}
+
+btn.onclick = () => search(q.value);
+q.addEventListener('keydown', e => { if (e.key === 'Enter') search(q.value); });
+</script>
