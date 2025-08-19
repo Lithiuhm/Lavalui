@@ -1,22 +1,10 @@
 services:
-  lavalink:
-    image: ghcr.io/lavalink-devs/lavalink:4
-    container_name: lavalink
-    restart: unless-stopped
-    networks: [traefik]
-    expose:
-      - "2333"
-    volumes:
-      - ./lavalink/application.yml:/opt/Lavalink/application.yml:ro
-      - ./lavalink/plugins:/opt/Lavalink/plugins
-
   myspot:
     build: ./app
     container_name: myspot
     restart: unless-stopped
-    environment:
-      - LAVA_URL=http://lavalink:2333
-      - LAVA_PASS=youshallnotpass
+    env_file:
+      - .env
     networks: [traefik]
     labels:
       - traefik.enable=true

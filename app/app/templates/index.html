@@ -1,0 +1,82 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Web UI · Lavalink público</title>
+  <link rel="stylesheet" href="/static/style.css"/>
+</head>
+<body>
+  <h1>Buscar y reproducir</h1>
+  <div class="row">
+    <label>Fuente:
+      <select id="src">
+        <option value="yt">YouTube</option>
+        <option value="sp">Spotify</option>
+        <option value="dz">Deezer</option>
+      </select>
+    </label>
+    <input id="q" placeholder="consulta..." />
+    <button id="btn">Buscar</button>
+  </div>
+
+  <ul id="results"></ul>
+
+  <div class="controls">
+    <audio id="player" controls preload="none" style="width: 100%;"></audio>
+    <button onclick="stop()">Stop</button>
+  </div>
+
+<script>
+const q = document.getElementById('q');
+const src = document.getElementById('src');
+const btn = document.getElementById('btn');
+const results = document.getElementById('results');
+const audio = document.getElementById('player');
+
+btn.onclick = async () => {
+  results.innerHTML = 'Buscando...';
+  const r = await fetch(`/api/search?source=${encodeURIComponent(src.value)}&q=${encodeURIComponent(q.value)}`);
+  const data = await r.json();
+  results.innerHTML = '';
+  (data.results || []).forEach(row => {
+    const li = document.createElement('li');
+
+    if (row.cover) {
+      const img = document.createElement('img');
+      img.src = row.cover; img.width = 40; img.height = 40;
+      img.style.verticalAlign = 'middle';
+      li.appendChild(img);
+    }
+
+    const span = document.createElement('span');
+    span.textContent = ' ' + (row.info?.title || row.display);
+    li.appendChild(span);
+
+    const b = document.createElement('button');
+    b.textContent = 'Play';
+    b.className = 'play';
+    b.onclick = () => play(row.vid || row.info?.identifier);
+    li.appendChild(b);
+
+    results.appendChild(li);
+  });
+};
+
+async function play(vid) {
+  if (!vid) { alert('No hay videoId'); return; }
+  audio.pause();
+  audio.src = `/audio/${encodeURIComponent(vid)}`;
+  // Espera a tener buffer suficiente antes de reproducir (mejora “instantáneo percibido”)
+  const onCanPlay = () => { audio.play().catch(console.error); audio.removeEventListener('canplay', onCanPlay); };
+  audio.addEventListener('canplay', onCanPlay);
+  // por si ya está listo
+  audio.play().catch(()=>{ /* se reproducirá en canplay */ });
+}
+
+async function stop(){
+  audio.pause();
+  audio.currentTime = 0;
+}
+</script>
+</body>
+</html>
