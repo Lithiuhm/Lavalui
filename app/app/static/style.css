@@ -1,8 +1,8 @@
-body { font-family: system-ui, sans-serif; margin: 24px; }
-.row { display: flex; gap: 8px; align-items: center; }
-ul { padding: 0; margin-top: 16px; }
-li { margin: 8px 0; list-style: none; display: flex; align-items: center; gap: 8px; }
-button { padding: 6px 10px; cursor: pointer; }
-button.play { margin-left: auto; }
-.controls { margin-top: 16px; display: flex; gap: 8px; }
-img { border-radius: 4px; }
+body { font-family: system-ui, sans-serif; margin: 20px; background: #f9f9f9; }
+h1 { color: #333; }
+.search { display:flex; gap:8px; margin-bottom:12px; }
+ul { list-style:none; padding:0; margin:0; }
+li { display:flex; align-items:center; gap:8px; padding:6px 0; }
+button { margin-left:auto; padding:6px 10px; border:none; background:#0078d7; color:#fff; border-radius:4px; cursor:pointer; }
+button:hover { background:#005a9e; }
+.play { margin-left:auto; }

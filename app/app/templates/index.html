@@ -1,82 +1,192 @@
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>Web UI · Lavalink público</title>
-  <link rel="stylesheet" href="/static/style.css"/>
-</head>
 <body>
-  <h1>Buscar y reproducir</h1>
+  <h1>🎵 Music.santiagoac.com</h1>
+
   <div class="row">
     <label>Fuente:
       <select id="src">
-        <option value="yt">YouTube</option>
-        <option value="sp">Spotify</option>
-        <option value="dz">Deezer</option>
+        <option value="yt" selected>YouTube</option>
+        <option value="sp">Spotify → YT</option>
+        <option value="dz">Deezer → YT</option>
+        <option value="sc">SoundCloud</option>
+        <option value="bc">Bandcamp → YT</option>
       </select>
     </label>
-    <input id="q" placeholder="consulta..." />
+    <input id="q" placeholder="buscar..." value="bad guy" />
     <button id="btn">Buscar</button>
   </div>
 
-  <ul id="results"></ul>
+  <div id="results" class="grid"></div>
 
-  <div class="controls">
-    <audio id="player" controls preload="none" style="width: 100%;"></audio>
-    <button onclick="stop()">Stop</button>
+  <h3>Reproductor</h3>
+  <audio id="player" preload="none" controls style="width:100%;"></audio>
+  <div class="row">
+    <button id="btnStop">Stop</button>
+    <button id="btnTest" class="muted" title="Abre la URL de audio en otra pestaña">Abrir URL directa</button>
   </div>
+  <p class="muted" id="status">Listo</p>
+
+  <h3>Logs</h3>
+  <div id="log"></div>
+
+<style>
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill,minmax(240px,1fr));
+    gap: 12px;
+  }
+  .card {
+    background:#fff; border:1px solid #eee; border-radius:10px; padding:10px;
+    display:flex; gap:10px;
+  }
+  .thumb { width:84px; height:84px; border-radius:8px; object-fit:cover; background:#ddd; }
+  .meta { flex:1; min-width:0; }
+  .title { font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .sub { color:#777; font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .badg { font-size:11px; background:#f2f2f2; padding:2px 6px; border-radius:6px; display:inline-block; margin-top:4px;}
+  .actions { display:flex; align-items:center; gap:8px; }
+</style>
 
 <script>
-const q = document.getElementById('q');
-const src = document.getElementById('src');
-const btn = document.getElementById('btn');
-const results = document.getElementById('results');
-const audio = document.getElementById('player');
+const qs   = (s) => document.querySelector(s);
+const log  = (m) => { const el = qs('#log'); const t = `[${new Date().toLocaleTimeString()}] ${m}\n`; el.textContent += t; el.scrollTop = el.scrollHeight; };
+
+const btn = qs('#btn');
+const src = qs('#src');
+const q   = qs('#q');
+const results = qs('#results');
+const audio = qs('#player');
+const status = qs('#status');
+const btnStop = qs('#btnStop');
+const btnTest = qs('#btnTest');
+
+let lastVid = null;
+let lastUrl = null;
+
+function setStatus(s){ status.textContent = s; log(s); }
+function msToTime(ms){ if(!ms&&ms!==0) return ""; const t=Math.floor(ms/1000); const m=Math.floor(t/60); const s=t%60; return `${m}:${s.toString().padStart(2,'0')}`; }
+
+function wireAudioEvents() {
+  ['loadstart','durationchange','loadedmetadata','canplay','playing','pause','stalled','waiting','suspend','ended','seeking','seeked','timeupdate','error']
+  .forEach(ev => audio.addEventListener(ev, () => log(`audio:${ev} t=${audio.currentTime.toFixed(2)}`)));
+}
+wireAudioEvents();
+
+btnStop.onclick = () => { audio.pause(); audio.currentTime = 0; setStatus('Parado'); };
+btnTest.onclick = () => { if (lastUrl) window.open(lastUrl, '_blank'); else if (lastVid) window.open(`/audio-proxy/${encodeURIComponent(lastVid)}`, '_blank'); };
 
 btn.onclick = async () => {
-  results.innerHTML = 'Buscando...';
-  const r = await fetch(`/api/search?source=${encodeURIComponent(src.value)}&q=${encodeURIComponent(q.value)}`);
-  const data = await r.json();
+  const s = src.value; const query = q.value.trim();
+  if (!query) return;
   results.innerHTML = '';
-  (data.results || []).forEach(row => {
-    const li = document.createElement('li');
+  setStatus('Buscando…');
 
-    if (row.cover) {
-      const img = document.createElement('img');
-      img.src = row.cover; img.width = 40; img.height = 40;
-      img.style.verticalAlign = 'middle';
-      li.appendChild(img);
+  try {
+    const r = await fetch(`/api/search?source=${encodeURIComponent(s)}&q=${encodeURIComponent(query)}`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    const arr = data.results || [];
+
+    if (!arr.length) {
+      results.innerHTML = '<div class="muted">Sin resultados</div>';
+      setStatus('Sin resultados');
+      return;
     }
+    setStatus('Resultados listos');
 
-    const span = document.createElement('span');
-    span.textContent = ' ' + (row.info?.title || row.display);
-    li.appendChild(span);
+    for (const row of arr) {
+      const imgUrl = row.info?.artworkUrl || row.cover || '/static/no-cover.png';
+      const title  = row.info?.title || row.display || '(sin título)';
+      const author = row.info?.author || '';
+      const len    = msToTime(row.info?.length);
+      const badge  = row.info?.sourceName || 'desconocido';
 
-    const b = document.createElement('button');
-    b.textContent = 'Play';
-    b.className = 'play';
-    b.onclick = () => play(row.vid || row.info?.identifier);
-    li.appendChild(b);
+      const card = document.createElement('div');
+      card.className = 'card';
 
-    results.appendChild(li);
-  });
+      const img = document.createElement('img');
+      img.className = 'thumb';
+      img.src = imgUrl;
+
+      const meta = document.createElement('div');
+      meta.className = 'meta';
+      meta.innerHTML = `
+        <div class="title" title="${title}">${title}</div>
+        <div class="sub" title="${author}">${author}</div>
+        <div class="sub">${len ? '⏱ '+len : ''}</div>
+        <div class="badg">${badge}</div>
+      `;
+
+      const actions = document.createElement('div');
+      actions.className = 'actions';
+      const btnPlay = document.createElement('button');
+      btnPlay.textContent = '▶ Play';
+
+      // Sólo reproducimos si hay vídeo YT válido (11 chars). Otros los dejamos deshabilitados por ahora.
+      const vid = row.vid && row.vid.length === 11 ? row.vid : null;
+      if (!vid) {
+        btnPlay.disabled = true;
+        btnPlay.title = 'No reproducible (playlist/canal o fuente sin vid YT directo)';
+      } else {
+        btnPlay.onclick = () => playVid(vid);
+      }
+      actions.appendChild(btnPlay);
+
+      card.append(img, meta, actions);
+      results.appendChild(card);
+    }
+  } catch (e) {
+    setStatus('❌ Error buscando: ' + e.message);
+  }
 };
 
-async function play(vid) {
-  if (!vid) { alert('No hay videoId'); return; }
-  audio.pause();
-  audio.src = `/audio/${encodeURIComponent(vid)}`;
-  // Espera a tener buffer suficiente antes de reproducir (mejora “instantáneo percibido”)
-  const onCanPlay = () => { audio.play().catch(console.error); audio.removeEventListener('canplay', onCanPlay); };
-  audio.addEventListener('canplay', onCanPlay);
-  // por si ya está listo
-  audio.play().catch(()=>{ /* se reproducirá en canplay */ });
+async function playVid(vid) {
+  lastVid = vid;
+
+  // helper que prepara <audio>, espera canplay (hasta 7s) y hace play()
+  async function tryUrl(u) {
+    // limpiar <audio> sin hacer pause() mientras un play() esté en curso
+    audio.removeAttribute('src');
+    while (audio.firstChild) audio.removeChild(audio.firstChild);
+
+    const s = document.createElement('source');
+    s.src = u;
+    audio.appendChild(s);
+    audio.load();
+
+    // esperamos canplay, pero no bloqueamos duro si no llega
+    const canplay = new Promise(res => {
+      const fn = () => { audio.removeEventListener('canplay', fn); res(); };
+      audio.addEventListener('canplay', fn);
+    });
+    const to = new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout canplay')), 7000));
+    try { await Promise.race([canplay, to]); } catch(_) {}
+
+    // importante: NO llames a pause() alrededor de este play()
+    await audio.play();
+    lastUrl = u;
+    return true;
+  }
+
+  // 1) Proxy directo
+  const proxyUrl = `/audio-proxy/${encodeURIComponent(vid)}`;
+  setStatus(`Resolviendo vía proxy: ${proxyUrl}`);
+  try {
+    if (await tryUrl(proxyUrl)) { setStatus('▶️ Reproduciendo (proxy directo)'); return; }
+  } catch (e) {
+    setStatus('proxy directo falló: ' + (e?.message || e));
+  }
+
+  // 2) Fallback /audio (redirige a la fuente pública)
+  const redirUrl = `/audio/${encodeURIComponent(vid)}`;
+  setStatus(`Probando fallback /audio: ${redirUrl}`);
+  try {
+    if (await tryUrl(redirUrl)) { setStatus('▶️ Reproduciendo (fallback /audio)'); return; }
+  } catch (e) {
+    setStatus('❌ ningún método pudo reproducir: ' + (e?.message || e));
+  }
 }
 
-async function stop(){
-  audio.pause();
-  audio.currentTime = 0;
-}
+// primera búsqueda automática
+btn.click();
 </script>
 </body>
-</html>

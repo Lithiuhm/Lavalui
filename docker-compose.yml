@@ -12,6 +12,8 @@ services:
       - traefik.http.routers.myspot.entrypoints=websecure
       - traefik.http.routers.myspot.tls.certresolver=letsencrypt
       - traefik.http.services.myspot.loadbalancer.server.port=8000
+    expose:
+      - "8000"
 
 networks:
   traefik:
