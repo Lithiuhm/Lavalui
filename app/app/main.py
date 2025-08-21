@@ -2,26 +2,45 @@ import os
 import time
 import random
 import re
-import shutil
-import tempfile
 from typing import List, Tuple, Optional, Dict, Any
 import asyncio
 from datetime import datetime
-from anyio import EndOfStream
-import anyio
+import ipaddress
 
 import httpx
-from starlette.responses import StreamingResponse
 from fastapi import FastAPI, Request, HTTPException, Header
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, Response, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import (
+    HTMLResponse, RedirectResponse, StreamingResponse, Response, FileResponse
+)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+
 # =========================
-#   Configuración nodos LL
+#   Configuración general
 # =========================
 
 RAW_NODES = os.getenv("LAVA_NODES", "").split(",")
 LAVA_TIMEOUT = int(os.getenv("LAVA_TIMEOUT_MS", "8000"))  # ms
+
+PIPED_INSTANCES = [s.strip() for s in os.getenv(
+    "PIPED_INSTANCES",
+    "https://piped.mha.fi,https://piped.garudalinux.org,https://piped.lunar.icu,https://piped.video"
+).split(",") if s.strip()]
+
+INVIDIOUS_INSTANCES = [s.strip() for s in os.getenv(
+    "INVIDIOUS_INSTANCES",
+    "https://yewtu.be,https://iv.ggtyler.dev,https://invidious.slipfox.xyz,https://invidious.fdn.fr"
+).split(",") if s.strip()]
+
+RESOLVE_TIMEOUT = float(os.getenv("RESOLVE_TIMEOUT", "8"))  # s
+CACHE_TTL = int(os.getenv("RESOLVE_CACHE_TTL", "600"))      # s
+_UA = {"User-Agent": "Mozilla/5.0 (compatible; lavalui/1.0)"}
+_ITAGS = [140, 251, 171, 250, 249]  # 140=m4a/aac, 251=webm/opus...
+
+# =========================
+#   Utilidades Lavalink
+# =========================
 
 def extract_tracks(obj: Dict[str, Any]) -> List[Dict[str, Any]]:
     # v3: "tracks", v4: "data"
@@ -29,7 +48,7 @@ def extract_tracks(obj: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def parse_node(s: str) -> Optional[Tuple[str, str]]:
     """
-    Acepta:
+    Formatos:
       - 'https://host:443|password'
       - 'https://host:443:password' (fallback)
     """
@@ -47,82 +66,7 @@ def parse_node(s: str) -> Optional[Tuple[str, str]]:
     return None
 
 NODES: List[Tuple[str, str]] = [n for n in (parse_node(x) for x in RAW_NODES) if n]
-
-# Cache salud nodos
 _health_cache: Dict[str, Tuple[bool, float]] = {}  # base -> (ok, ts)
-
-async def _list_candidates(vid: str) -> List[str]:
-    """Devuelve varias URLs candidatas de Piped e Invidious."""
-    urls: List[str] = []
-
-    # 1) Piped (audioStreams directos)
-    async with httpx.AsyncClient(follow_redirects=True, headers=_UA, timeout=RESOLVE_TIMEOUT) as c:
-        for base in PIPED_INSTANCES:
-            try:
-                r = await c.get(f"{base}/streams/{vid}")
-                if r.status_code != 200:
-                    continue
-                js = r.json()
-                streams = js.get("audioStreams") or []
-                if not streams:
-                    continue
-
-                # prioriza M4A/AAC; si no hay, el mayor bitrate (suele ser webm/opus)
-                m4a = [s for s in streams if ('m4a' in (s.get('mimeType') or '').lower()) or ('audio/mp4' in (s.get('mimeType') or '').lower())]
-                if m4a:
-                    m4a.sort(key=lambda s: s.get('bitrate', 0) or 0, reverse=True)
-                    if m4a[0].get('url'):
-                        urls.append(m4a[0]['url'])
-                else:
-                    best = max(streams, key=lambda s: s.get("bitrate", 0) or 0)
-                    if best.get('url'):
-                        urls.append(best['url'])
-            except Exception:
-                continue
-
-    # 2) Invidious latest_version (forzamos proxy local=true) con itags típicos
-    for base in INVIDIOUS_INSTANCES:
-        for it in [140, 251, 171, 250, 249]:
-            urls.append(f"{base}/latest_version?id={vid}&itag={it}&local=true")
-
-    # quitar duplicados manteniendo orden
-    seen = set()
-    uniq = []
-    for u in urls:
-        if u in seen:
-            continue
-        seen.add(u)
-        uniq.append(u)
-    return uniq
-
-
-async def _open_stream_validated(url: str, range_header: Optional[str]) -> Tuple[httpx.Response, httpx.AsyncClient]:
-    """
-    Abre el stream real (sin sonda previa). http2=False para estabilidad.
-    Devuelve (response_stream, client). Quien llama debe cerrar ambos.
-    """
-    client = httpx.AsyncClient(follow_redirects=True, headers=_UA, timeout=None, http2=False)
-
-    headers = {}
-    if range_header:
-        headers["Range"] = range_header
-
-    try:
-        req = client.build_request("GET", url, headers=headers)
-        resp = await client.send(req, stream=True)  # <- clave: send(..., stream=True)
-        if resp.status_code >= 400:
-            await resp.aclose()
-            await client.aclose()
-            raise HTTPException(502, f"upstream {resp.status_code}")
-        return resp, client
-    except Exception:
-        # si algo falla, cerramos el client
-        try:
-            await client.aclose()
-        except Exception:
-            pass
-        raise
-
 
 async def check_node(client: httpx.AsyncClient, base: str, password: str) -> bool:
     try:
@@ -150,25 +94,10 @@ async def pick_node() -> Tuple[str, str]:
     raise HTTPException(502, "Todos los nodos Lavalink fallan en /v4/info")
 
 # =========================
-#   Resolución audio público
+#   Resolución audio público (NO youtube.com)
 # =========================
 
-PIPED_INSTANCES = [s.strip() for s in os.getenv(
-    "PIPED_INSTANCES",
-    "https://piped.mha.fi,https://piped.garudalinux.org,https://piped.lunar.icu,https://piped.video"
-).split(",") if s.strip()]
-
-INVIDIOUS_INSTANCES = [s.strip() for s in os.getenv(
-    "INVIDIOUS_INSTANCES",
-    "https://yewtu.be,https://iv.ggtyler.dev,https://invidious.slipfox.xyz,https://invidious.fdn.fr"
-).split(",") if s.strip()]
-
-RESOLVE_TIMEOUT = float(os.getenv("RESOLVE_TIMEOUT", "8"))  # s
-CACHE_TTL = int(os.getenv("RESOLVE_CACHE_TTL", "600"))      # s
-
 _resolve_cache: Dict[str, Tuple[float, str]] = {}  # vid -> (exp_ts, url)
-_UA = {"User-Agent": "Mozilla/5.0 (compatible; lavalui/1.0)"}
-_ITAGS = [140, 251, 171, 250, 249]
 
 async def _try_piped(client: httpx.AsyncClient, base: str, vid: str) -> Optional[str]:
     try:
@@ -179,9 +108,13 @@ async def _try_piped(client: httpx.AsyncClient, base: str, vid: str) -> Optional
         streams = js.get("audioStreams") or []
         if not streams:
             return None
+        # prioriza m4a/aac si hay; si no, el mayor bitrate
+        m4a = [s for s in streams if ('m4a' in (s.get('mimeType') or '').lower()) or ('audio/mp4' in (s.get('mimeType') or '').lower())]
+        if m4a:
+            m4a.sort(key=lambda s: s.get('bitrate', 0) or 0, reverse=True)
+            return m4a[0].get("url")
         best = max(streams, key=lambda s: s.get("bitrate", 0) or 0)
-        url = best.get("url")
-        return url
+        return best.get("url")
     except Exception:
         return None
 
@@ -197,6 +130,10 @@ async def _try_invidious_latest(client: httpx.AsyncClient, base: str, vid: str) 
     return None
 
 async def resolve_public_audio_url(vid: str) -> Optional[str]:
+    """
+    Devuelve una URL reproducible de Piped o Invidious.
+    Nunca devuelve un host de youtube.com.
+    """
     now = time.time()
     cached = _resolve_cache.get(vid)
     if cached and cached[0] > now:
@@ -290,17 +227,29 @@ async def search_source_list(source: str, query: str) -> List[Dict[str, Any]]:
         return [{"display": f"Bandcamp→YT: {query}", "identifier": f"ytsearch:{query}"}]
     else:
         raise HTTPException(400, "source debe ser yt|sp|dz|sc|bc")
+
 # =========================
 #   FastAPI + UI
 # =========================
 
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://music.santiagoac.com","http://localhost:8000","*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 templates = Jinja2Templates(directory="app/templates")
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
+
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True, "time": datetime.utcnow().isoformat()+"Z"}
 
 @app.get("/api/search")
 async def api_search(source: str, q: str):
@@ -316,16 +265,15 @@ async def api_search(source: str, q: str):
 
             for t in tracks[:10]:
                 info = t.get("info", {}) or {}
-                # vid solo si realmente es vídeo de YouTube (evita playlists PL..., canales, etc.)
                 vid = None
                 if info.get("sourceName") == "youtube":
                     ident = info.get("identifier") or ""
-                    if len(ident) == 11:  # típico videoId
+                    if len(ident) == 11:
                         vid = ident
 
                 final.append({
                     "display": cand.get("display"),
-                    "encoded": t.get("encoded"),  # por si luego quieres usar Lavalink directo
+                    "encoded": t.get("encoded"),
                     "info": {
                         "title": info.get("title"),
                         "author": info.get("author"),
@@ -334,7 +282,6 @@ async def api_search(source: str, q: str):
                         "sourceName": info.get("sourceName"),
                         "artworkUrl": info.get("artworkUrl"),
                     },
-                    # portada candidata extra (Deezer ya traía cover)
                     "cover": cand.get("cover"),
                     "vid": vid,
                 })
@@ -342,173 +289,111 @@ async def api_search(source: str, q: str):
             continue
 
     return {"results": final}
+
 # =========================
-#   PROXY de audio (passthrough con Range) + fallback HLS
+#   Streaming proxy directo (sigue disponible)
 # =========================
 
-RANGE_RE = re.compile(r"bytes=(\d+)-(\d+)?")
+async def _list_candidates(vid: str) -> List[str]:
+    urls: List[str] = []
+    # Piped
+    async with httpx.AsyncClient(follow_redirects=True, headers=_UA, timeout=RESOLVE_TIMEOUT) as c:
+        for base in PIPED_INSTANCES:
+            try:
+                r = await c.get(f"{base}/streams/{vid}")
+                if r.status_code != 200:
+                    continue
+                js = r.json()
+                streams = js.get("audioStreams") or []
+                if not streams:
+                    continue
+                m4a = [s for s in streams if ('m4a' in (s.get('mimeType') or '').lower()) or ('audio/mp4' in (s.get('mimeType') or '').lower())]
+                if m4a:
+                    m4a.sort(key=lambda s: s.get('bitrate', 0) or 0, reverse=True)
+                    if m4a[0].get('url'):
+                        urls.append(m4a[0]['url'])
+                else:
+                    best = max(streams, key=lambda s: s.get("bitrate", 0) or 0)
+                    if best.get('url'):
+                        urls.append(best['url'])
+            except Exception:
+                continue
+    # Invidious (últimos)
+    for base in INVIDIOUS_INSTANCES:
+        for it in _ITAGS:
+            urls.append(f"{base}/latest_version?id={vid}&itag={it}&local=true")
 
-def _filter_hop_by_hop(headers: Dict[str, str]) -> Dict[str, str]:
-    # Elimina cabeceras que no deben reenviarse
-    hop = {
-        "connection","keep-alive","proxy-authenticate","proxy-authorization",
-        "te","trailers","transfer-encoding","upgrade"
-    }
-    return {k: v for k, v in headers.items() if k.lower() not in hop}
+    # únicos
+    seen, uniq = set(), []
+    for u in urls:
+        if u in seen: continue
+        seen.add(u); uniq.append(u)
+    return uniq
 
-async def _proxy_stream(origin_url: str, client_range: Optional[str]) -> Response:
-    async with httpx.AsyncClient(follow_redirects=True) as client:
-        # Cabeceras hacia origen
-        req_headers = {"User-Agent": _UA["User-Agent"], "Accept": "*/*"}
-        if client_range:
-            req_headers["Range"] = client_range  # ej. "bytes=0-"
-
-        r = await client.get(origin_url, headers=req_headers, timeout=RESOLVE_TIMEOUT)
-
-        status = r.status_code
-
-        # Copiamos cabeceras útiles
-        out_headers: Dict[str, str] = {}
-        for k in [
-            "Content-Type", "Content-Length", "Content-Range",
-            "Accept-Ranges", "Cache-Control", "ETag", "Last-Modified"
-        ]:
-            if k in r.headers:
-                out_headers[k] = r.headers[k]
-
-        # Aseguramos Accept-Ranges aunque el origen no lo ponga
-        out_headers.setdefault("Accept-Ranges", "bytes")
-
-        # media_type correcto (evita que FastAPI meta text/html por defecto)
-        media_type = out_headers.get("Content-Type", "application/octet-stream")
-
-        async def gen():
-            async for chunk in r.aiter_bytes(chunk_size=64 * 1024):
-                yield chunk
-
-        return StreamingResponse(
-            gen(),
-            status_code=status,                # 200 o 206 según el origen
-            headers=_filter_hop_by_hop(out_headers),
-            media_type=media_type
-        )
-
-async def _open_upstream(url: str, range_header: Optional[str]) -> httpx.Response:
-    """
-    Abre una conexión streaming al origen, probando primero con Range (si viene),
-    y si falla, sin Range. Devuelve la respuesta httpx.Response abierta (stream=True).
-    Lanza excepción si ambas fallan.
-    """
-    headers = {"User-Agent": _UA["User-Agent"], "Accept": "*/*"}
-    client = httpx.AsyncClient(follow_redirects=True, timeout=None)
-
-    async def _do_get(with_range: bool):
-        h = headers.copy()
-        if with_range and range_header:
-            h["Range"] = range_header
-        # stream=True para no cargar todo en memoria
-        return await client.get(url, headers=h, stream=True)
-
+async def _open_stream_validated(url: str, range_header: Optional[str]) -> Tuple[httpx.Response, httpx.AsyncClient]:
+    client = httpx.AsyncClient(follow_redirects=True, headers=_UA, timeout=None, http2=False)
+    headers = {}
+    if range_header:
+        headers["Range"] = range_header
     try:
-        # 1) Con Range (si hay)
-        resp = await _do_get(with_range=True)
-        if resp.status_code < 400:
-            return resp, client
-        # 2) Sin Range
-        await resp.aclose()
-        resp = await _do_get(with_range=False)
-        if resp.status_code < 400:
-            return resp, client
-        # Si sigue mal, error
-        text = ""
-        try:
-            text = await resp.aread()
-            text = text.decode("utf-8", "ignore")[:200]
-        except Exception:
-            pass
-        await resp.aclose()
-        await client.aclose()
-        raise HTTPException(502, f"Origen respondió {resp.status_code}: {text or 'sin cuerpo'}")
-    except Exception as e:
-        # Cierra client si hubo excepción
-        try:
-            await client.aclose()
-        except Exception:
-            pass
+        req = client.build_request("GET", url, headers=headers)
+        resp = await client.send(req, stream=True)
+        if resp.status_code >= 400:
+            await resp.aclose(); await client.aclose()
+            raise HTTPException(502, f"upstream {resp.status_code}")
+        return resp, client
+    except Exception:
+        try: await client.aclose()
+        except Exception: pass
         raise
 
 @app.get("/audio-proxy/{vid}")
 async def audio_proxy(vid: str, request: Request):
-    """
-    Proxy de audio con reintentos y soporte Range.
-    - Si el upstream no devuelve Content-Range, reintentamos sin Range y entregamos 200.
-    - Forzamos Content-Type de audio si viene vacío/incorrecto (p. ej. text/html).
-    - No enviamos Content-Length (evita errores de longitud con streaming).
-    """
     range_header = request.headers.get("range")
     candidates = await _list_candidates(vid)
     if not candidates:
         raise HTTPException(404, f"No hay fuentes públicas para {vid}")
 
     last_err = None
-
     for url in candidates[:10]:
         try:
-            # 1) Intento respetando Range del cliente (si existe)
             resp, client = await _open_stream_validated(url, range_header)
         except HTTPException as e:
-            last_err = e
-            continue
+            last_err = e; continue
         except Exception as e:
-            last_err = HTTPException(502, repr(e))
-            continue
+            last_err = HTTPException(502, repr(e)); continue
 
-        # Si el cliente pidió Range pero el upstream NO respondió con Content-Range,
-        # reabrimos SIN Range para entregar 200 (muchos players lo aceptan).
         if range_header and not resp.headers.get("content-range"):
             try:
-                await resp.aclose()
-                await client.aclose()
-            except Exception:
-                pass
+                await resp.aclose(); await client.aclose()
+            except Exception: pass
             try:
                 resp, client = await _open_stream_validated(url, None)
             except Exception as e:
                 last_err = HTTPException(502, f"no soporta Range y fallo sin Range: {e!r}")
                 continue
 
-        # --- Cabeceras hacia el cliente ---
-        # Content-Type del upstream (si es inválido/ausente, forzamos audio)
         upstream_ct = (resp.headers.get("content-type") or "").lower()
         ct = upstream_ct if (upstream_ct and not upstream_ct.startswith("text/")) else "audio/webm"
-
-        # Heurística: si la URL trae itag=140 o parece m4a, fuerza MP4 para máxima compatibilidad
         low_url = url.lower()
         if "itag=140" in low_url or "audio/mp4" in upstream_ct or low_url.endswith(".m4a"):
             ct = "audio/mp4"
 
-        # ¿206 o 200?
         status = 206 if resp.headers.get("content-range") else 200
-
-        # Construimos headers mínimos (nada de Content-Length)
         out_headers = {
             "accept-ranges": "bytes",
             "cache-control": "no-store",
             "content-type": ct,
-            # este header ayuda a desactivar bufferizaciones en algunos reverse proxies
             "x-accel-buffering": "no",
-            # aconseja inline en navegador
-            "content-disposition": "inline"
+            "content-disposition": "inline",
         }
-        # Propagamos Content-Range si existe
         if resp.headers.get("content-range"):
             out_headers["content-range"] = resp.headers["content-range"]
 
         async def body_iter():
             try:
                 async for chunk in resp.aiter_bytes(64 * 1024):
-                    if await request.is_disconnected():
-                        break
+                    if await request.is_disconnected(): break
                     yield chunk
             finally:
                 try:
@@ -516,47 +401,40 @@ async def audio_proxy(vid: str, request: Request):
                 finally:
                     await client.aclose()
 
-        # ¡OJO!: además de poner el header, pasamos media_type para que Starlette no meta text/html
         return StreamingResponse(body_iter(), status_code=status, headers=out_headers, media_type=ct)
 
-    if last_err:
-        raise last_err
+    if last_err: raise last_err
     raise HTTPException(502, "No se pudo abrir ninguna fuente de audio")
 
+# Redirect simple (por si quieres abrir en pestaña)
+@app.get("/audio/{vid}")
+async def audio_redirect(vid: str):
+    origin = await resolve_public_audio_url(vid)
+    if not origin:
+        raise HTTPException(404, f"No se pudo resolver audio para {vid}")
+    return RedirectResponse(url=origin, status_code=302)
 
 # =========================
-#   HLS Fallback (FFmpeg → .m3u8)
+#   HLS Fallback (opcional)
 # =========================
 
-# Carpeta temporal raíz para HLS
 HLS_ROOT = "/tmp/hls_lavalui"
 os.makedirs(HLS_ROOT, exist_ok=True)
-
-# token -> {"dir":..., "expires": ts}
 _hls_index: Dict[str, Dict[str, Any]] = {}
 
 async def _ensure_hls_build(vid: str) -> Tuple[str, str]:
-    """
-    Asegura que existan los ficheros HLS para vid.
-    Devuelve (token, playlist_path_rel).
-    """
-    # Reutiliza token si existe y no ha expirado
     for token, meta in list(_hls_index.items()):
         if meta.get("vid") == vid and meta["expires"] > time.time():
             return token, f"/hls/{token}/index.m3u8"
 
-    # Resuelve URL origen
     origin = await resolve_public_audio_url(vid)
     if not origin:
-        raise HTTPException(404, f"No se pudo resolver audio para {vid} (Piped/Invidious)")
+        raise HTTPException(404, f"No se pudo resolver audio para {vid}")
 
-    # Nuevo token/carpeta
     token = f"{vid}-{int(time.time())}-{random.randint(1000,9999)}"
     out_dir = os.path.join(HLS_ROOT, token)
     os.makedirs(out_dir, exist_ok=True)
 
-    # Comando FFmpeg (transcodifica a AAC para máxima compatibilidad)
-    # Latencia aproximada: ~2-6s con hls_time=4
     cmd = [
         "ffmpeg", "-y", "-v", "quiet",
         "-i", origin,
@@ -569,43 +447,200 @@ async def _ensure_hls_build(vid: str) -> Tuple[str, str]:
         "-hls_segment_filename", os.path.join(out_dir, "seg%03d.ts"),
         os.path.join(out_dir, "index.m3u8"),
     ]
-
-    # Lanza FFmpeg en background (no esperamos a que termine; el player irá leyendo)
-    proc = await asyncio.create_subprocess_exec(*cmd)
-    # Guardamos metadatos con un TTL
-    _hls_index[token] = {"dir": out_dir, "expires": time.time() + 3600, "pid": proc.pid, "vid": vid}
-
+    await asyncio.create_subprocess_exec(*cmd)
+    _hls_index[token] = {"dir": out_dir, "expires": time.time() + 3600, "vid": vid}
     return token, f"/hls/{token}/index.m3u8"
 
 @app.get("/audio-hls/{vid}")
 async def audio_hls_entry(vid: str):
-    """
-    Devuelve un redirect a la playlist HLS (generando si no existe).
-    Usa esto como fallback desde el frontend (con hls.js).
-    """
     token, rel = await _ensure_hls_build(vid)
     return RedirectResponse(url=rel, status_code=302)
 
 @app.get("/hls/{token}/{fname}")
 async def serve_hls(token: str, fname: str):
-    """
-    Sirve ficheros HLS generados. Seguridad básica por token y whitelisting.
-    """
     meta = _hls_index.get(token)
     if not meta or meta["expires"] < time.time():
         raise HTTPException(404, "HLS expirado")
-    # whitelist simple
     if not re.match(r"^(index\.m3u8|seg\d{3}\.ts)$", fname):
         raise HTTPException(400, "Nombre de fichero inválido")
 
     path = os.path.join(meta["dir"], fname)
     if not os.path.isfile(path):
-        # Puede tardar un pelín en aparecer el primer índice
         raise HTTPException(404, "HLS no listo")
-    # MIME correcto
+
     if fname.endswith(".m3u8"):
         return FileResponse(path, media_type="application/vnd.apple.mpegurl")
     return FileResponse(path, media_type="video/MP2T")
+
+# =========================
+#   Preparación local (M4A) con límites
+# =========================
+
+PREP_ROOT = os.getenv("PREP_ROOT", "/tmp/prep_audio")
+os.makedirs(PREP_ROOT, exist_ok=True)
+
+MAX_SECONDS = int(os.getenv("PREP_MAX_SECONDS", "7200"))      # 2h
+CLEANUP_TTL = int(os.getenv("PREP_CLEANUP_TTL", "7200"))      # 2h
+MAX_CONCURRENT = int(os.getenv("PREP_MAX_CONCURRENT", "2"))   # prepara 2 a la vez
+
+# rate limit muy simple: ip -> [t1,t2,...] (timestamps de peticiones POST /prepare)
+RL_WINDOW = int(os.getenv("PREP_RL_WINDOW", "60"))  # seg
+RL_MAX = int(os.getenv("PREP_RL_MAX", "6"))         # máx inicios por ventana
+
+_prep_jobs: Dict[str, Dict[str, Any]] = {}
+_prep_sem = asyncio.Semaphore(MAX_CONCURRENT)
+_rl_hits: Dict[str, List[float]] = {}
+
+def _client_ip(req: Request) -> str:
+    # intenta X-Forwarded-For por Traefik/CF; cae a client.host
+    xf = req.headers.get("x-forwarded-for", "")
+    if xf:
+        ip = xf.split(",")[0].strip()
+    else:
+        ip = req.client.host if req.client else "0.0.0.0"
+    # sanity
+    try:
+        ipaddress.ip_address(ip)
+    except Exception:
+        ip = "0.0.0.0"
+    return ip
+
+def _rate_limit_check(ip: str) -> bool:
+    now = time.time()
+    arr = _rl_hits.get(ip, [])
+    arr = [t for t in arr if now - t < RL_WINDOW]
+    if len(arr) >= RL_MAX:
+        _rl_hits[ip] = arr
+        return False
+    arr.append(now)
+    _rl_hits[ip] = arr
+    return True
+
+def _token_for(vid: str) -> str:
+    return f"{vid}-{int(time.time())}-{random.randint(1000,9999)}"
+
+async def _ffmpeg_prepare(origin_url: str, out_path: str) -> Tuple[bool, str]:
+    cmd = [
+        "ffmpeg", "-y", "-v", "error",
+        "-i", origin_url,
+        "-vn",
+        "-c:a", "aac", "-b:a", "160k",
+        "-movflags", "+faststart",
+        "-t", str(MAX_SECONDS),
+        out_path,
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, err = await proc.communicate()
+    ok = (proc.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0)
+    if not ok:
+        try: os.remove(out_path)
+        except Exception: pass
+    return ok, (err.decode("utf-8", "ignore") if err else "")
+
+async def _run_prep_job(token: str, vid: str):
+    job = _prep_jobs[token]
+    job["status"] = "resolving"
+    try:
+        origin = await resolve_public_audio_url(vid)
+        if not origin:
+            job["status"] = "error"; job["msg"] = "No se pudo resolver una URL pública"; return
+
+        job["status"] = "queued"
+        async with _prep_sem:
+            job["status"] = "downloading"
+            out_path = os.path.join(PREP_ROOT, f"{token}.m4a")
+            ok, fferr = await _ffmpeg_prepare(origin, out_path)
+            if not ok:
+                job["status"] = "error"; job["msg"] = f"ffmpeg falló: {fferr[:200]}"; return
+            job["status"] = "ready"; job["path"] = out_path; job["done"] = time.time(); job["msg"] = "ok"
+    except Exception as e:
+        job["status"] = "error"; job["msg"] = repr(e)
+
+def _cleanup_jobs():
+    now = time.time()
+    for t, j in list(_prep_jobs.items()):
+        if j.get("done") and now - j["done"] > CLEANUP_TTL:
+            try:
+                if j.get("path"): os.remove(j["path"])
+            except Exception:
+                pass
+            _prep_jobs.pop(t, None)
+
+@app.post("/api/prepare/{vid}")
+async def api_prepare_start(vid: str, request: Request):
+    ip = _client_ip(request)
+    if not _rate_limit_check(ip):
+        raise HTTPException(429, "Demasiadas preparaciones, intenta más tarde")
+    token = _token_for(vid)
+    _prep_jobs[token] = {
+        "vid": vid, "status": "queued", "msg": None,
+        "path": None, "started": time.time(), "done": None, "ip": ip
+    }
+    asyncio.create_task(_run_prep_job(token, vid))
+    return {"token": token}
+
+@app.get("/api/prepare/{token}")
+async def api_prepare_status(token: str):
+    _cleanup_jobs()
+    job = _prep_jobs.get(token)
+    if not job: raise HTTPException(404, "token desconocido")
+    return {
+        "status": job["status"],
+        "msg": job.get("msg"),
+        "path": bool(job.get("path")),
+        "vid": job.get("vid"),
+    }
+
+@app.get("/audio-local/{token}")
+async def audio_local(token: str, range: Optional[str] = Header(None)):
+    job = _prep_jobs.get(token)
+    if not job or job.get("status") != "ready" or not job.get("path"):
+        raise HTTPException(404, "no listo")
+    path = job["path"]
+    file_size = os.path.getsize(path)
+
+    # Range
+    start, end = 0, file_size - 1
+    if range:
+        m = re.match(r"bytes=(\d+)-(\d+)?", range or "")
+        if m:
+            start = int(m.group(1))
+            if m.group(2): end = int(m.group(2))
+            if end >= file_size: end = file_size - 1
+            if start > end: raise HTTPException(416, "Range Not Satisfiable")
+    length = end - start + 1
+
+    async def iter_file(p: str, start_pos: int, bytes_left: int):
+        with open(p, "rb") as f:
+            f.seek(start_pos)
+            chunk = 64 * 1024
+            while bytes_left > 0:
+                n = f.read(min(chunk, bytes_left))
+                if not n: break
+                bytes_left -= len(n)
+                yield n
+
+    headers = {
+        "Content-Type": "audio/mp4",
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "no-store",
+        "Content-Disposition": "inline",
+    }
+    status_code = 200
+    if range:
+        headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+        status_code = 206
+
+    return StreamingResponse(
+        iter_file(path, start, length),
+        status_code=status_code,
+        headers=headers,
+        media_type="audio/mp4",
+    )
 
 # =========================
 #   Debug
@@ -650,10 +685,3 @@ async def api_debug_load(identifier: str):
 async def api_debug_pick():
     base, _ = await pick_node()
     return {"node": base}
-
-@app.get("/audio/{vid}")
-async def audio_redirect(vid: str):
-    origin = await resolve_public_audio_url(vid)
-    if not origin:
-        raise HTTPException(404, f"No se pudo resolver audio para {vid}")
-    return RedirectResponse(url=origin, status_code=302)

@@ -17,62 +17,42 @@
 
   <div id="results" class="grid"></div>
 
-  <h3>Reproductor</h3>
-  <audio id="player" preload="none" controls style="width:100%;"></audio>
-  <div class="row">
-    <button id="btnStop">Stop</button>
-    <button id="btnTest" class="muted" title="Abre la URL de audio en otra pestaña">Abrir URL directa</button>
-  </div>
+  <h3>Reproductor (preparación local)</h3>
+  <audio id="player" preload="metadata" controls style="width:100%;"></audio>
   <p class="muted" id="status">Listo</p>
 
   <h3>Logs</h3>
-  <div id="log"></div>
+  <pre id="log" style="max-height:260px;overflow:auto;background:#111;color:#9f9;padding:8px;border-radius:6px;"></pre>
 
 <style>
-  .grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill,minmax(240px,1fr));
-    gap: 12px;
-  }
-  .card {
-    background:#fff; border:1px solid #eee; border-radius:10px; padding:10px;
-    display:flex; gap:10px;
-  }
-  .thumb { width:84px; height:84px; border-radius:8px; object-fit:cover; background:#ddd; }
+  :root { color-scheme: dark; }
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:#0b0b0b; color:#eee; margin:20px; }
+  .row { display:flex; gap:10px; align-items:center; margin:8px 0; flex-wrap:wrap; }
+  .grid { display:grid; grid-template-columns: repeat(auto-fill,minmax(260px,1fr)); gap:12px; margin-top:10px; }
+  .card { background:#151515; border:1px solid #2a2a2a; border-radius:12px; padding:10px; display:flex; gap:10px; }
+  .thumb { width:84px; height:84px; border-radius:8px; object-fit:cover; background:#333; }
   .meta { flex:1; min-width:0; }
   .title { font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  .sub { color:#777; font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  .badg { font-size:11px; background:#f2f2f2; padding:2px 6px; border-radius:6px; display:inline-block; margin-top:4px;}
-  .actions { display:flex; align-items:center; gap:8px; }
+  .sub { color:#aaa; font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .badg { font-size:11px; background:#222; padding:2px 6px; border-radius:6px; display:inline-block; margin-top:4px; color:#ccc;}
+  button { background:#1e88ff; color:white; border:0; padding:6px 10px; border-radius:8px; cursor:pointer; }
+  button[disabled]{ opacity:.5; cursor:not-allowed; }
+  input, select { background:#131313; color:#eee; border:1px solid #2a2a2a; padding:6px 8px; border-radius:8px; }
+  .muted { color:#aaa; }
 </style>
 
 <script>
-const qs   = (s) => document.querySelector(s);
-const log  = (m) => { const el = qs('#log'); const t = `[${new Date().toLocaleTimeString()}] ${m}\n`; el.textContent += t; el.scrollTop = el.scrollHeight; };
+const qs  = (s) => document.querySelector(s);
+const log = (m) => { const el = qs('#log'); const t = `[${new Date().toLocaleTimeString()}] ${m}\n`; el.textContent += t; el.scrollTop = el.scrollHeight; };
+const setStatus = (s) => { qs('#status').textContent = s; log(s); };
 
-const btn = qs('#btn');
 const src = qs('#src');
 const q   = qs('#q');
+const btn = qs('#btn');
 const results = qs('#results');
 const audio = qs('#player');
-const status = qs('#status');
-const btnStop = qs('#btnStop');
-const btnTest = qs('#btnTest');
 
-let lastVid = null;
-let lastUrl = null;
-
-function setStatus(s){ status.textContent = s; log(s); }
 function msToTime(ms){ if(!ms&&ms!==0) return ""; const t=Math.floor(ms/1000); const m=Math.floor(t/60); const s=t%60; return `${m}:${s.toString().padStart(2,'0')}`; }
-
-function wireAudioEvents() {
-  ['loadstart','durationchange','loadedmetadata','canplay','playing','pause','stalled','waiting','suspend','ended','seeking','seeked','timeupdate','error']
-  .forEach(ev => audio.addEventListener(ev, () => log(`audio:${ev} t=${audio.currentTime.toFixed(2)}`)));
-}
-wireAudioEvents();
-
-btnStop.onclick = () => { audio.pause(); audio.currentTime = 0; setStatus('Parado'); };
-btnTest.onclick = () => { if (lastUrl) window.open(lastUrl, '_blank'); else if (lastVid) window.open(`/audio-proxy/${encodeURIComponent(lastVid)}`, '_blank'); };
 
 btn.onclick = async () => {
   const s = src.value; const query = q.value.trim();
@@ -85,52 +65,31 @@ btn.onclick = async () => {
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
     const arr = data.results || [];
+    if (!arr.length) { results.innerHTML = '<div class="muted">Sin resultados</div>'; setStatus('Sin resultados'); return; }
 
-    if (!arr.length) {
-      results.innerHTML = '<div class="muted">Sin resultados</div>';
-      setStatus('Sin resultados');
-      return;
-    }
     setStatus('Resultados listos');
-
-    for (const row of arr) {
+    for (const row of arr.slice(0,10)) {
       const imgUrl = row.info?.artworkUrl || row.cover || '/static/no-cover.png';
       const title  = row.info?.title || row.display || '(sin título)';
       const author = row.info?.author || '';
       const len    = msToTime(row.info?.length);
       const badge  = row.info?.sourceName || 'desconocido';
+      const vid    = row.vid && row.vid.length === 11 ? row.vid : null;
 
-      const card = document.createElement('div');
-      card.className = 'card';
-
-      const img = document.createElement('img');
-      img.className = 'thumb';
-      img.src = imgUrl;
-
-      const meta = document.createElement('div');
-      meta.className = 'meta';
+      const card = document.createElement('div'); card.className = 'card';
+      const img = document.createElement('img'); img.className = 'thumb'; img.src = imgUrl; img.loading = 'lazy';
+      const meta = document.createElement('div'); meta.className = 'meta';
       meta.innerHTML = `
         <div class="title" title="${title}">${title}</div>
         <div class="sub" title="${author}">${author}</div>
         <div class="sub">${len ? '⏱ '+len : ''}</div>
         <div class="badg">${badge}</div>
       `;
-
       const actions = document.createElement('div');
-      actions.className = 'actions';
-      const btnPlay = document.createElement('button');
-      btnPlay.textContent = '▶ Play';
-
-      // Sólo reproducimos si hay vídeo YT válido (11 chars). Otros los dejamos deshabilitados por ahora.
-      const vid = row.vid && row.vid.length === 11 ? row.vid : null;
-      if (!vid) {
-        btnPlay.disabled = true;
-        btnPlay.title = 'No reproducible (playlist/canal o fuente sin vid YT directo)';
-      } else {
-        btnPlay.onclick = () => playVid(vid);
-      }
-      actions.appendChild(btnPlay);
-
+      const b = document.createElement('button'); b.textContent = 'Preparar y reproducir';
+      if (!vid) { b.disabled = true; b.title = 'No se puede preparar (no es vídeo YT)'; }
+      b.onclick = () => prepareAndPlay(vid, title);
+      actions.appendChild(b);
       card.append(img, meta, actions);
       results.appendChild(card);
     }
@@ -139,50 +98,39 @@ btn.onclick = async () => {
   }
 };
 
-async function playVid(vid) {
-  lastVid = vid;
-
-  // helper que prepara <audio>, espera canplay (hasta 7s) y hace play()
-  async function tryUrl(u) {
-    // limpiar <audio> sin hacer pause() mientras un play() esté en curso
-    audio.removeAttribute('src');
-    while (audio.firstChild) audio.removeChild(audio.firstChild);
-
-    const s = document.createElement('source');
-    s.src = u;
-    audio.appendChild(s);
-    audio.load();
-
-    // esperamos canplay, pero no bloqueamos duro si no llega
-    const canplay = new Promise(res => {
-      const fn = () => { audio.removeEventListener('canplay', fn); res(); };
-      audio.addEventListener('canplay', fn);
-    });
-    const to = new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout canplay')), 7000));
-    try { await Promise.race([canplay, to]); } catch(_) {}
-
-    // importante: NO llames a pause() alrededor de este play()
-    await audio.play();
-    lastUrl = u;
-    return true;
-  }
-
-  // 1) Proxy directo
-  const proxyUrl = `/audio-proxy/${encodeURIComponent(vid)}`;
-  setStatus(`Resolviendo vía proxy: ${proxyUrl}`);
+async function prepareAndPlay(vid, title) {
+  setStatus(`Preparando «${title}»…`);
+  log('Solicitando preparación local…');
   try {
-    if (await tryUrl(proxyUrl)) { setStatus('▶️ Reproduciendo (proxy directo)'); return; }
-  } catch (e) {
-    setStatus('proxy directo falló: ' + (e?.message || e));
-  }
+    const r = await fetch(`/api/prepare/${encodeURIComponent(vid)}`, { method: 'POST' });
+    if (!r.ok) throw new Error(`prepare HTTP ${r.status}`);
+    const { token } = await r.json();
 
-  // 2) Fallback /audio (redirige a la fuente pública)
-  const redirUrl = `/audio/${encodeURIComponent(vid)}`;
-  setStatus(`Probando fallback /audio: ${redirUrl}`);
-  try {
-    if (await tryUrl(redirUrl)) { setStatus('▶️ Reproduciendo (fallback /audio)'); return; }
+    let tries = 0;
+    while (true) {
+      const s = await fetch(`/api/prepare/${token}`);
+      if (!s.ok) throw new Error(`status HTTP ${s.status}`);
+      const js = await s.json();
+      if (js.status === 'ready') {
+        setStatus('Listo. Reproduciendo…');
+        const url = `/audio-local/${token}`;
+        audio.removeAttribute('src'); while (audio.firstChild) audio.removeChild(audio.firstChild);
+        const srcEl = document.createElement('source'); srcEl.src = url; srcEl.type = 'audio/mp4';
+        audio.appendChild(srcEl);
+        audio.load();
+        await audio.play();
+        setStatus('▶️ Reproduciendo (desde caché local del servidor)');
+        break;
+      } else if (js.status === 'error') {
+        throw new Error(js.msg || 'fallo preparando');
+      } else {
+        setStatus(`Estado: ${js.status}…`);
+      }
+      await new Promise(r => setTimeout(r, Math.min(2500 + tries*250, 5000)));
+      tries++;
+    }
   } catch (e) {
-    setStatus('❌ ningún método pudo reproducir: ' + (e?.message || e));
+    setStatus('❌ Error preparando: ' + e.message);
   }
 }
 
